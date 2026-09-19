@@ -1,0 +1,189 @@
+diff --git a/include/REL/ID.h b/include/REL/ID.h
+index 8d7f2be2..64881ed1 100644
+--- a/include/REL/ID.h
++++ b/include/REL/ID.h
+@@ -183,10 +183,12 @@ namespace REL
+             bool failed = false;
+             if (it == _id2offset.end()) {
+                 failed = true;
+-            } else if SKYRIM_REL_VR_CONSTEXPR (Module::IsVR()) {
+-                if (it->id != a_id) {
+-                    failed = true;
+-                }
++            } else if (it->id != a_id) {
++                // std::lower_bound returns the first element NOT LESS than the key, so a
++                // miss lands on the next-highest id rather than failing. Upstream only
++                // checked this under Module::IsVR(); on SE and AE a missing id silently
++                // resolved to a neighbour's offset. Verify the exact key on every runtime.
++                failed = true;
+             }
+             if (failed) {
+                 stl::report_and_fail(
+@@ -253,7 +255,10 @@ namespace REL
+             {
+                 std::int32_t format{};
+                 a_in.readin(format);
+-                if (format != a_formatVersion) {
++                // Format 5 is meh321's dense table, introduced with Skyrim 1.7.99 and the
++                // only container shipped for 1.7.x. An AE build asks for format 2; accept 5
++                // as well and remember which one actually arrived.
++                if (format != a_formatVersion && !(a_formatVersion == 2 && format == 5)) {
+                     stl::report_and_fail(
+                             std::format(
+                                     "Unsupported address library format: {}\n"
+@@ -263,14 +268,28 @@ namespace REL
+                                     format));
+                 }
+ 
++                _format = format;
++
+                 std::int32_t version[4]{};
+-                std::int32_t nameLen{};
+                 a_in.readin(version);
+-                a_in.readin(nameLen);
+-                a_in.ignore(nameLen);
+ 
+-                a_in.readin(_pointerSize);
+-                a_in.readin(_addressCount);
++                if (format == 5) {
++                    // Dense header tail: a FIXED 64-byte module name, then pointerSize, a
++                    // reserved data-format int (always 0), and count = the dense table
++                    // length (highest id + 1). Formats 1/2 carry a length-prefixed name.
++                    a_in.ignore(64);
++                    a_in.readin(_pointerSize);
++                    std::int32_t dataFormat{};
++                    a_in.readin(dataFormat);
++                    a_in.readin(_addressCount);
++                } else {
++                    std::int32_t nameLen{};
++                    a_in.readin(nameLen);
++                    a_in.ignore(nameLen);
++
++                    a_in.readin(_pointerSize);
++                    a_in.readin(_addressCount);
++                }
+ 
+                 for (std::size_t i = 0; i < std::extent_v<decltype(version)>; ++i) {
+                     _version[i] = static_cast<std::uint16_t>(version[i]);
+@@ -283,10 +302,13 @@ namespace REL
+ 
+             [[nodiscard]] Version version() const noexcept { return _version; }
+ 
++            [[nodiscard]] std::int32_t format() const noexcept { return _format; }
++
+         private:
+             Version      _version;
+             std::int32_t _pointerSize{0};
+             std::int32_t _addressCount{0};
++            std::int32_t _format{0};
+         };
+ 
+         IDDatabase() = default;
+@@ -330,6 +352,32 @@ namespace REL
+ 
+         bool unpack_file(istream_t &a_in, header_t a_header, bool a_failOnError)
+         {
++            if (a_header.format() == 5) {
++                // Dense table: one uint32 offset per id, indexed by id, 0 == unassigned.
++                // versionlib-1-7-104-0.bin is 565,759 slots of which 130,597 (23.1%) are
++                // holes. They MUST NOT be inserted: id2offset() does a lower_bound, so a
++                // hole would be found and return offset 0, and REL::Relocation would then
++                // resolve to module base + 0 -- the game calls into its own PE header.
++                // Filter them so the table ends up sparse, exactly like format 2. The real
++                // entry count goes in the sentinel slot load_file allocated past the dense
++                // region, so the shared-mapping reuse path can recover it without re-reading
++                // the file. The result is already ascending by id, so load_file's std::sort
++                // is a harmless no-op on this path.
++                auto* const base = _id2offset.data();
++                const auto  denseCount = _id2offset.size();
++                std::size_t written = 0;
++                for (std::uint64_t id = 0; id < denseCount; ++id) {
++                    std::uint32_t off = 0;
++                    a_in.readin(off);
++                    if (off != 0) {
++                        base[written++] = {id, static_cast<std::uint64_t>(off)};
++                    }
++                }
++                base[denseCount] = {static_cast<std::uint64_t>(written), 0};
++                _id2offset = {base, written};
++                return true;
++            }
++
+             std::uint8_t type = 0;
+             std::uint64_t id = 0;
+             std::uint64_t offset = 0;
+diff --git a/include/REL/Module.h b/include/REL/Module.h
+index 54a484c7..00daa8c8 100644
+--- a/include/REL/Module.h
++++ b/include/REL/Module.h
+@@ -169,6 +169,10 @@ namespace REL
+ 						_instance._runtime = Runtime::VR;
+ 						break;
+ 					case 6:
++					case 7:
++						// 1.7.x (1.7.99, 1.7.104, ...) is a post-Anniversary release. Without
++						// this arm it falls through to SE, and the whole library then resolves
++						// SE ids against an AE offset table.
+ 						_instance._runtime = Runtime::AE;
+ 						break;
+ 					default:
+@@ -340,6 +344,9 @@ namespace REL
+ 						_runtime = Runtime::VR;
+ 						break;
+ 					case 6:
++					case 7:
++						// See mock(): 1.7.x is AE. Falling through to SE here made every
++						// RELOCATION_ID(se, ae) pick the SE id on Skyrim 1.7.104.
+ 						_runtime = Runtime::AE;
+ 						break;
+ 					default:
+diff --git a/src/REL/ID.cpp b/src/REL/ID.cpp
+index 8d6104a0..51b7284f 100644
+--- a/src/REL/ID.cpp
++++ b/src/REL/ID.cpp
+@@ -103,19 +103,40 @@ namespace REL
+ 				return stl::report_and_error("version mismatch"sv, a_failOnError);
+ 			}
+ 
+-			auto mapname = L"CommonLibSSEOffsets-v2-"s;
++			// Format 5 is unpacked into a SPARSE table (holes filtered out), so it needs one
++			// extra slot past the dense region to carry the real entry count, and a distinct
++			// shared-mapping name so a plugin built against the unpatched header cannot open
++			// our mapping and read the sparse layout as if it were dense.
++			const bool dense = header.format() == 5;
++			auto mapname = dense ? L"CommonLibSSEOffsets-v5f-"s : L"CommonLibSSEOffsets-v2-"s;
+ 			mapname += a_version.wstring();
+-			const auto byteSize = static_cast<std::size_t>(header.address_count()) * sizeof(mapping_t);
++			const auto slots = header.address_count() + (dense ? 1u : 0u);
++			const auto byteSize = static_cast<std::size_t>(slots) * sizeof(mapping_t);
++			bool unpack = false;
+ 			if (_mmap.open(mapname, byteSize)) {
+-				_id2offset = { static_cast<mapping_t*>(_mmap.data()), header.address_count() };
++				auto* const base = static_cast<mapping_t*>(_mmap.data());
++				const auto  count = dense
++					? static_cast<std::size_t>(base[header.address_count()].id)
++					: header.address_count();
++				// A dense sentinel still reading 0 means whoever created this mapping has not
++				// finished unpacking into it yet (or died mid-unpack). Handing out a zero-length
++				// span would make every later lookup fail; unpack it ourselves instead. A second
++				// writer produces byte-identical content, which is the same benign double-write
++				// the create() path can already perform.
++				unpack = dense && count == 0;
++				_id2offset = { base, unpack ? header.address_count() : count };
+ 			} else if (_mmap.create(mapname, byteSize)) {
+ 				_id2offset = { static_cast<mapping_t*>(_mmap.data()), header.address_count() };
++				unpack = true;
++			} else {
++				return stl::report_and_error("failed to create shared mapping"sv, a_failOnError);
++			}
++
++			if (unpack) {
+ 				unpack_file(in, header, a_failOnError);
+ 				std::sort(_id2offset.begin(), _id2offset.end(), [](auto&& a_lhs, auto&& a_rhs) {
+ 					return a_lhs.id < a_rhs.id;
+ 				});
+-			} else {
+-				return stl::report_and_error("failed to create shared mapping"sv, a_failOnError);
+ 			}
+ 		} catch (const std::system_error &) {
+ 			return stl::report_and_error(

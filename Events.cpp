@@ -10,6 +10,20 @@ namespace PFF
         return &singleton;
     }
 
+    // Catches actors that are mid-unload or partially torn down.  The cell's
+    // BSSpinLock keeps the NiPointer alive, but the actor's own fields (parent
+    // cell, 3D, base form) may already be invalidated during a cell transition
+    // or save load.  Returning false for any of these means the caller skips
+    // the actor rather than dereferencing garbage.
+    bool FleeManager::IsActorValid(RE::Actor* actor)
+    {
+        if (!actor) return false;
+        if (actor->IsDeleted() || actor->IsDisabled()) return false;
+        if (!actor->GetParentCell()) return false;
+        if (!actor->Get3D()) return false;
+        return true;
+    }
+
     // A torch or lantern in Skyrim is a TESObjectLIGH equipped directly (not a weapon with a
     // light attached) -- checking both hands for an equipped Light covers vanilla torches and
     // any lantern mod that follows the same wieldable-light convention. This deliberately does
@@ -59,27 +73,6 @@ namespace PFF
         if (settings->bAffectLightningSpells && IsCastingElementalSpell(actor, RE::ActorValue::kResistShock)) return true;
         if (settings->bAffectPoisonSpells && IsCastingElementalSpell(actor, RE::ActorValue::kPoisonResist)) return true;
         return false;
-    }
-
-    RE::TESObjectREFR* FleeManager::FindNearestLitLightHolder(RE::TESObjectCELL* cell, const RE::NiPoint3& origin, float radius)
-    {
-        RE::TESObjectREFR* nearest = nullptr;
-        float nearestDist = radius;
-
-        cell->ForEachReferenceInRange(origin, radius, [&](RE::TESObjectREFR& ref) {
-            auto* actor = ref.As<RE::Actor>();
-            if (!actor || actor->IsDead()) return RE::BSContainer::ForEachResult::kContinue;
-            if (!HasDeterrent(actor)) return RE::BSContainer::ForEachResult::kContinue;
-
-            float dist = origin.GetDistance(actor->GetPosition());
-            if (dist < nearestDist) {
-                nearest = actor;
-                nearestDist = dist;
-            }
-            return RE::BSContainer::ForEachResult::kContinue;
-        });
-
-        return nearest;
     }
 
     // SkyPatcher's keyword-framework rules (RKF_ActorType*, and vanilla ActorTypeHorse/
@@ -259,16 +252,53 @@ namespace PFF
         }
 
         auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player || !player->GetParentCell()) {
-            logger::trace("PFF: OnTick called but no player/cell");
+        if (!player || !player->Is3DLoaded() || !player->GetParentCell()) {
+            logger::trace("PFF: OnTick called but no player/3D/cell");
             return;
         }
-        auto cell = player->GetParentCell();
+        auto* cell = player->GetParentCell();
+        auto playerPos = player->GetPosition(); // copy -- safe across iterations
         logger::trace("PFF: OnTick running, cell=0x{:X}", cell->GetFormID());
 
-        cell->ForEachReferenceInRange(player->GetPosition(), settings->fStalkDistance, [&](RE::TESObjectREFR& ref) {
-            auto* actor = ref.As<RE::Actor>();
+        // --- Phase 1: collect deterrent holders -------------------------------------------
+        // A single ForEachReferenceInRange pass collects every actor in range that is
+        // carrying a lit torch or actively casting an enabled spell.  This replaces the
+        // old FindNearestLitLightHolder, which was called *inside* the creature scan's
+        // own ForEachReferenceInRange lambda -- nesting two iterations on the same cell
+        // under the same BSSpinLock.  BSSpinLock is reentrant so it didn't deadlock, but
+        // the double lock-hold widened the window for another thread (the engine's own
+        // cell-transition code) to leave a partially-torn-down reference in the list that
+        // the inner iteration would then dereference.
+        //
+        // Collecting holders first and searching the vector in phase 2 eliminates the
+        // nested iteration entirely.
+        const float holderRadius = settings->fStalkDistance + settings->fDetectionRadius;
+        std::vector<DeterrentHolder> holders;
+        holders.reserve(8); // most cells have few torch-carriers
+
+        // TESObjectCELL::ForEachReferenceInRange takes
+        // std::function<BSContainer::ForEachResult(TESObjectREFR*)> -- a POINTER, which the
+        // engine can hand us as null for a torn-down reference. Verified in
+        // CommonLibSSE-NG/include/RE/T/TESObjectCELL.h:199.
+        cell->ForEachReferenceInRange(playerPos, holderRadius, [&](RE::TESObjectREFR* ref) {
+            if (!ref) return RE::BSContainer::ForEachResult::kContinue;
+            if (ref->IsDeleted() || ref->IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
+            auto* actor = ref->As<RE::Actor>();
+            if (!actor || actor->IsDead()) return RE::BSContainer::ForEachResult::kContinue;
+            if (!IsActorValid(actor)) return RE::BSContainer::ForEachResult::kContinue;
+            if (HasDeterrent(actor)) {
+                holders.push_back({actor, actor->GetPosition()});
+            }
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+
+        // --- Phase 2: creature scan ------------------------------------------------------
+        cell->ForEachReferenceInRange(playerPos, settings->fStalkDistance, [&](RE::TESObjectREFR* ref) {
+            if (!ref) return RE::BSContainer::ForEachResult::kContinue;
+            if (ref->IsDeleted() || ref->IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
+            auto* actor = ref->As<RE::Actor>();
             if (!actor || actor->IsPlayerRef() || actor->IsDead()) return RE::BSContainer::ForEachResult::kContinue;
+            if (!IsActorValid(actor)) return RE::BSContainer::ForEachResult::kContinue;
             if (IsExcluded(actor)) return RE::BSContainer::ForEachResult::kContinue;
 
             auto category = GetSpeciesCategory(actor);
@@ -284,7 +314,18 @@ namespace PFF
                     logger::trace("PFF: {} on cooldown, skipping", actor->GetName());
                     break;
                 }
-                auto* holder = FindNearestLitLightHolder(cell, actor->GetPosition(), settings->fDetectionRadius);
+                // Find the nearest deterrent holder from the pre-collected vector
+                RE::TESObjectREFR* holder = nullptr;
+                float nearestDist = settings->fDetectionRadius;
+                auto actorPos = actor->GetPosition();
+                for (auto& h : holders) {
+                    float dist = actorPos.GetDistance(h.position);
+                    if (dist < nearestDist) {
+                        holder = h.actor;
+                        nearestDist = dist;
+                    }
+                }
+
                 if (holder) {
                     // InitiateFlee (with or without StopCombat()) proved unreliable across two
                     // full test rounds -- confirmed via live log that the actor's own combat
@@ -313,7 +354,8 @@ namespace PFF
 
             case FleeBehaviorState::kStalking: {
                 auto* holderActor = RE::TESForm::LookupByID<RE::Actor>(tracker.lightHolderID);
-                bool activeNow = holderActor && !holderActor->IsDead() && HasDeterrent(holderActor);
+                bool activeNow = holderActor && !holderActor->IsDead() &&
+                                 IsActorValid(holderActor) && HasDeterrent(holderActor);
                 auto now = RE::Calendar::GetSingleton()->GetCurrentGameTime() * 24.0f;
                 if (activeNow) {
                     // Refreshes every tick for a continuously-held torch (no behavior change there)
@@ -344,5 +386,18 @@ namespace PFF
 
             return RE::BSContainer::ForEachResult::kContinue;
         });
+
+        // --- Tracker pruning --------------------------------------------------------------
+        // Remove entries for actors whose FormIDs are no longer loaded.  Without this the
+        // map grows without bound across cell transitions, and a recycled FormID could
+        // inherit a stale cooldown/state from a completely different actor.
+        for (auto it = trackers.begin(); it != trackers.end(); ) {
+            auto* form = RE::TESForm::LookupByID(it->first);
+            if (!form || !form->Is(RE::FormType::ActorCharacter)) {
+                it = trackers.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 }

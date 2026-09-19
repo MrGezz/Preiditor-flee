@@ -12,5 +12,8 @@
         "commonlibsse-ng-flatrim"
       ]
     }
+  ],
+  "overlay-ports": [
+    "./overlayports"
   ]
 }

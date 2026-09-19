@@ -361,3 +361,12 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# Build output staged into the distributable tree by the IcZ workspace (see PORT-SSE.md).
+Skyrim/Data/SKSE/Plugins/*.dll
+Skyrim/Data/SKSE/Plugins/*.pdb
+build/
+install/
+
+# vcpkg's per-project install tree: build output, and its caches record the build path.
+vcpkg_installed/
+buildtrees/

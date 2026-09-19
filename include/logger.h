@@ -12,10 +12,19 @@ inline void SetupLog() {
     auto fileLoggerPtr = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
     auto loggerPtr = std::make_shared<spdlog::logger>("log", std::move(fileLoggerPtr));
     spdlog::set_default_logger(std::move(loggerPtr));
-    // Forced to trace regardless of build config while diagnosing the flee logic -- dial back
-    // to info once the behavior is confirmed working end-to-end.
+    // Was forced to trace while diagnosing the flee logic, with a note to dial it back once the
+    // behaviour was confirmed end to end. It was, in game, on 2026-09-13 -- and at trace level
+    // OnTick wrote a line every 500 ms plus one per nearby actor, each flushed to disk: 2,735
+    // trace lines and 259,380 bytes in a 20-minute session, growing without bound. Builds with NDEBUG
+    // defined (Release, RelWithDebInfo) now log at info and flush each info line, which are rare
+    // (load and save-game events) and worth keeping if the game dies. A Debug build keeps trace.
+#ifndef NDEBUG
     spdlog::set_level(spdlog::level::trace);
     spdlog::flush_on(spdlog::level::trace);
+#else
+    spdlog::set_level(spdlog::level::info);
+    spdlog::flush_on(spdlog::level::info);
+#endif
     logger::info("Name of the plugin is {}.", pluginName);
     // NOTE: logging SKSE::PluginDeclaration::GetSingleton()->GetVersion() directly fails to
     // compile against this fmt v12 -- REL::Version's custom formatter isn't const-qualified the

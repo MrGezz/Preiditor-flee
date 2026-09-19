@@ -1,3 +1,0 @@
-C:/Preiditor flee/vcpkg_installed/vcpkg/pkgs/rapidcsv_x64-windows/include/rapidcsv.h
-C:/Preiditor flee/vcpkg_installed/vcpkg/pkgs/rapidcsv_x64-windows/cmake/rapidcsvTargets.cmake
-C:/Preiditor flee/vcpkg_installed/vcpkg/pkgs/rapidcsv_x64-windows/cmake/rapidcsvConfig.cmake

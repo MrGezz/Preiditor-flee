@@ -36,6 +36,14 @@ namespace
         FlushFileBuffers(h);
         CloseHandle(h);
     }
+
+    // Set on kPreLoadGame / before-new-game; cleared on kPostLoadGame / kNewGame.
+    // While true the tick thread skips posting tasks, preventing OnTick from
+    // running against a partially-torn-down game world.
+    void SetShutdownFlag(bool value)
+    {
+        PFF::FleeManager::GetSingleton()->shutdownFlag.store(value, std::memory_order_release);
+    }
 }
 
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
@@ -54,7 +62,8 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 
     auto* messaging = SKSE::GetMessagingInterface();
     messaging->RegisterListener([](SKSE::MessagingInterface::Message* msg) {
-        if (msg->type == SKSE::MessagingInterface::kDataLoaded) {
+        switch (msg->type) {
+        case SKSE::MessagingInterface::kDataLoaded:
             PFF::Settings::GetSingleton()->Load();
             PFF::Menu::Register();
             logger::info("PFF: kDataLoaded -- settings loaded, menu registered, starting tick thread");
@@ -67,11 +76,33 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
             std::thread([]() {
                 while (true) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    if (PFF::FleeManager::GetSingleton()->shutdownFlag.load(std::memory_order_acquire)) {
+                        continue; // game world is being torn down; skip this tick
+                    }
                     SKSE::GetTaskInterface()->AddTask([]() {
                         PFF::FleeManager::GetSingleton()->OnTick();
                     });
                 }
             }).detach();
+            break;
+
+        // Suppress OnTick while the game world is being rebuilt.  kPreLoadGame fires
+        // before the engine tears down the current world for a save-load; kNewGame and
+        // kPostLoadGame fire once the new world is ready.
+        case SKSE::MessagingInterface::kPreLoadGame:
+            logger::info("PFF: kPreLoadGame -- suppressing OnTick");
+            SetShutdownFlag(true);
+            break;
+
+        case SKSE::MessagingInterface::kNewGame:
+            logger::info("PFF: kNewGame -- resuming OnTick");
+            SetShutdownFlag(false);
+            break;
+
+        case SKSE::MessagingInterface::kPostLoadGame:
+            logger::info("PFF: kPostLoadGame -- resuming OnTick");
+            SetShutdownFlag(false);
+            break;
         }
     });
 
